@@ -130,6 +130,13 @@ from redis.exceptions import (
     TryAgainError,
     WatchError,
 )
+from redis.follow_scope import (
+    WRITE_SCRIPT_COMMANDS,
+    FollowScope,
+    is_follow_ignored,
+    normalize_command,
+    select_cluster_node,
+)
 from redis.himport import HImportRegistry, parse_himport_set_args
 from redis.maint_notifications import MaintNotificationsConfig
 from redis.typing import (
@@ -1048,13 +1055,72 @@ class RedisCluster(
         replica_safe = (
             self.read_from_replicas or self.load_balancing_strategy is not None
         ) and await self._is_replica_safe(command)
-        return [
-            self.nodes_manager.get_node_from_slot(
-                await self._determine_slot(command, *args),
-                replica_safe,
-                self.load_balancing_strategy if replica_safe else None,
-            )
-        ]
+        slot = await self._determine_slot(command, *args)
+        return [await self._select_slot_node(command, slot, replica_safe)]
+
+    async def _select_slot_node(
+        self, command: str, slot: int, replica_safe: bool
+    ) -> "ClusterNode":
+        """
+        Pick the node for a keyed command.
+
+        Inside an active follow scope, a slot the scope has already bound stays
+        on its primary for both reads and writes; ignored commands and unbound
+        slots keep their current selection.
+        """
+        if not is_follow_ignored(command):
+            scope = FollowScope.current()
+            if scope is not None:
+                node = select_cluster_node(scope, slot, self.nodes_manager)
+                if node is not None:
+                    return node
+        return self.nodes_manager.get_node_from_slot(
+            slot,
+            replica_safe,
+            self.load_balancing_strategy if replica_safe else None,
+        )
+
+    def follow_scope(self) -> FollowScope:
+        """
+        Open a follow scope (async context manager) in which reads follow the
+        primary that accepted a write done earlier in the same scope.
+
+        ::
+
+            async with client.follow_scope():
+                await client.set("key", "value")
+                await client.get("key")  # primary above, never a replica
+
+        A scope object may only be entered by one asyncio task at a time.
+        """
+        return FollowScope()
+
+    async def _follow_bind_write(
+        self,
+        scope: FollowScope,
+        command: str,
+        args: tuple,
+        request_policy: Optional[RequestPolicy],
+    ) -> None:
+        """Bind the slots of a successful keyed write to its primary."""
+        if request_policy != RequestPolicy.DEFAULT_KEYED:
+            return
+        if is_follow_ignored(command):
+            return
+        if await self._is_replica_safe(command):
+            return
+
+        if command in WRITE_SCRIPT_COMMANDS:
+            # EVAL/EVALSHA "<script>" numkeys key [key ...] ...
+            slots = [self.keyslot(key) for key in args[3 : 3 + int(args[2])]]
+        else:
+            slot = await self._determine_slot(*args)
+            slots = [slot] if slot is not None else []
+        if not slots:
+            return
+        for slot in set(slots):
+            primary = self.nodes_manager.get_node_from_slot(slot, False)
+            scope.bind(slot, primary.name)
 
     def get_special_nodes(self) -> Optional[list["ClusterNode"]]:
         """
@@ -1407,9 +1473,17 @@ class RedisCluster(
                             f"No targets were found to execute {args} command on"
                         )
 
+                follow_scope = FollowScope.current()
                 if len(target_nodes) == 1:
                     # Return the processed result
                     ret = await self._execute_command(target_nodes[0], *args, **kwargs)
+                    if follow_scope is not None:
+                        await self._follow_bind_write(
+                            follow_scope,
+                            command,
+                            args,
+                            command_policies.request_policy,
+                        )
                     if command in self.result_callbacks:
                         ret = self.result_callbacks[command](
                             command, {target_nodes[0].name: ret}, **kwargs
@@ -1427,6 +1501,13 @@ class RedisCluster(
                             for node in target_nodes
                         )
                     )
+                    if follow_scope is not None:
+                        await self._follow_bind_write(
+                            follow_scope,
+                            command,
+                            args,
+                            command_policies.request_policy,
+                        )
                     if command in self.result_callbacks:
                         return self.result_callbacks[command](
                             command, dict(zip(keys, values)), **kwargs
@@ -1497,16 +1578,15 @@ class RedisCluster(
                     asking = False
                 elif moved:
                     # MOVED occurred and the slots cache was updated,
-                    # refresh the target node
+                    # refresh the target node through the same follow-scope
+                    # selection: a pinned read stays on the (new) primary.
                     slot = await self._determine_slot(*args)
                     replica_safe = (
                         self.read_from_replicas
                         or self.load_balancing_strategy is not None
                     ) and await self._is_replica_safe(args[0])
-                    target_node = self.nodes_manager.get_node_from_slot(
-                        slot,
-                        replica_safe,
-                        self.load_balancing_strategy if replica_safe else None,
+                    target_node = await self._select_slot_node(
+                        args[0], slot, replica_safe
                     )
                     moved = False
 
@@ -3191,113 +3271,206 @@ class PipelineStrategy(AbstractStrategy):
             cmd for cmd in stack if not cmd.result or isinstance(cmd.result, Exception)
         ]
 
+        # Follow-scope preview: queued writes pin their slot before a read
+        # queued later in the same pipeline selects its node. The batch is
+        # still packed per node exactly once and nothing is reordered.
+        follow_scope = FollowScope.current()
+        follow_prior: dict[int, Any] = {}
+        follow_spec: list[tuple["PipelineCommand", tuple]] = []
+        follow_finalized = False
+
         nodes = {}
-        for cmd in todo:
-            passed_targets = cmd.kwargs.pop("target_nodes", None)
-            target_nodes_specified = bool(passed_targets) and not client._is_node_flag(
-                passed_targets
-            )
-            _, command_policies = await client._resolve_command_policies(
-                *cmd.args, target_nodes_specified=target_nodes_specified
-            )
-
-            if target_nodes_specified:
-                target_nodes = client._parse_target_nodes(passed_targets)
-            else:
-                target_nodes = await client._determine_nodes(
-                    *cmd.args,
-                    request_policy=command_policies.request_policy,
-                    node_flag=passed_targets,
+        try:
+            for cmd in todo:
+                passed_targets = cmd.kwargs.pop("target_nodes", None)
+                target_nodes_specified = bool(
+                    passed_targets
+                ) and not client._is_node_flag(passed_targets)
+                _, command_policies = await client._resolve_command_policies(
+                    *cmd.args, target_nodes_specified=target_nodes_specified
                 )
-                if not target_nodes:
-                    raise RedisClusterException(
-                        f"No targets were found to execute {cmd.args} command on"
-                    )
-            cmd.command_policies = command_policies
-            if len(target_nodes) > 1:
-                raise RedisClusterException(f"Too many targets for command {cmd.args}")
-            node = target_nodes[0]
-            if node.name not in nodes:
-                nodes[node.name] = (node, [])
-            nodes[node.name][1].append(cmd)
 
-        # Start timing for observability
-        start_time = time.monotonic()
-
-        errors = await asyncio.gather(
-            *(
-                asyncio.create_task(node[0].execute_pipeline(node[1]))
-                for node in nodes.values()
-            )
-        )
-
-        # Record operation duration for each node
-        for node_name, (node, commands) in nodes.items():
-            # Find the first error in this node's commands, if any
-            node_error = None
-            for cmd in commands:
-                if isinstance(cmd.result, Exception):
-                    node_error = cmd.result
-                    break
-
-            db = node.connection_kwargs.get("db", 0)
-            await record_operation_duration(
-                command_name="PIPELINE",
-                duration_seconds=time.monotonic() - start_time,
-                server_address=node.host,
-                server_port=node.port,
-                db_namespace=str(db) if db is not None else None,
-                error=node_error,
-            )
-
-        if any(errors):
-            if allow_redirections:
-                # send each errored command individually
-                for cmd in todo:
-                    if isinstance(cmd.result, (TryAgainError, MovedError, AskError)):
-                        try:
-                            cmd.result = client._policies_callback_mapping[
-                                cmd.command_policies.response_policy
-                            ](await client.execute_command(*cmd.args, **cmd.kwargs))
-                        except Exception as e:
-                            cmd.result = e
-
-            if raise_on_error:
-                for cmd in todo:
-                    result = cmd.result
-                    if isinstance(result, Exception):
-                        command = " ".join(map(safe_str, cmd.args))
-                        # Errors from the redirect retry may carry no args,
-                        # e.g. MaxConnectionsError() from acquire_connection().
-                        error = result.args[0] if result.args else type(result).__name__
-                        msg = (
-                            f"Command # {cmd.position + 1} "
-                            f"({truncate_text(command)}) "
-                            f"of pipeline caused error: {error}"
+                if target_nodes_specified:
+                    target_nodes = client._parse_target_nodes(passed_targets)
+                else:
+                    if follow_scope is not None:
+                        await self._follow_preview_write(
+                            follow_scope,
+                            follow_prior,
+                            follow_spec,
+                            cmd,
+                            command_policies,
                         )
-                        result.args = (msg,) + result.args[1:]
-                        raise result
+                    target_nodes = await client._determine_nodes(
+                        *cmd.args,
+                        request_policy=command_policies.request_policy,
+                        node_flag=passed_targets,
+                    )
+                    if not target_nodes:
+                        raise RedisClusterException(
+                            f"No targets were found to execute {cmd.args} command on"
+                        )
+                cmd.command_policies = command_policies
+                if len(target_nodes) > 1:
+                    raise RedisClusterException(
+                        f"Too many targets for command {cmd.args}"
+                    )
+                node = target_nodes[0]
+                if node.name not in nodes:
+                    nodes[node.name] = (node, [])
+                nodes[node.name][1].append(cmd)
 
-            default_cluster_node = client.get_default_node()
+            # Start timing for observability
+            start_time = time.monotonic()
 
-            # Check whether the default node was used. In some cases,
-            # 'client.get_default_node()' may return None. The check below
-            # prevents a potential AttributeError.
-            if default_cluster_node is not None:
-                default_node = nodes.get(default_cluster_node.name)
-                if default_node is not None:
-                    # This pipeline execution used the default node, check if we need
-                    # to replace it.
-                    # Note: when the error is raised we'll reset the default node in the
-                    # caller function.
-                    for cmd in default_node[1]:
-                        # Check if it has a command that failed with a relevant
-                        # exception
-                        if type(cmd.result) in RedisCluster.ERRORS_ALLOW_RETRY:
-                            client.replace_default_node()
-                            break
+            errors = await asyncio.gather(
+                *(
+                    asyncio.create_task(node[0].execute_pipeline(node[1]))
+                    for node in nodes.values()
+                )
+            )
 
-        return [cmd.result for cmd in stack]
+            # Record operation duration for each node
+            for node_name, (node, commands) in nodes.items():
+                # Find the first error in this node's commands, if any
+                node_error = None
+                for cmd in commands:
+                    if isinstance(cmd.result, Exception):
+                        node_error = cmd.result
+                        break
+
+                db = node.connection_kwargs.get("db", 0)
+                await record_operation_duration(
+                    command_name="PIPELINE",
+                    duration_seconds=time.monotonic() - start_time,
+                    server_address=node.host,
+                    server_port=node.port,
+                    db_namespace=str(db) if db is not None else None,
+                    error=node_error,
+                )
+
+            if any(errors):
+                if allow_redirections:
+                    # send each errored command individually
+                    for cmd in todo:
+                        if isinstance(
+                            cmd.result, (TryAgainError, MovedError, AskError)
+                        ):
+                            try:
+                                cmd.result = client._policies_callback_mapping[
+                                    cmd.command_policies.response_policy
+                                ](await client.execute_command(*cmd.args, **cmd.kwargs))
+                            except Exception as e:
+                                cmd.result = e
+
+                if follow_scope is not None:
+                    # Only successfully landed writes keep their pins; MOVED
+                    # repairs already rebound themselves to the new primary.
+                    self._follow_finalize_writes(
+                        follow_scope, follow_prior, follow_spec
+                    )
+                    follow_finalized = True
+
+                if raise_on_error:
+                    for cmd in todo:
+                        result = cmd.result
+                        if isinstance(result, Exception):
+                            command = " ".join(map(safe_str, cmd.args))
+                            # Errors from the redirect retry may carry no args,
+                            # e.g. MaxConnectionsError() from acquire_connection().
+                            error = (
+                                result.args[0] if result.args else type(result).__name__
+                            )
+                            msg = (
+                                f"Command # {cmd.position + 1} "
+                                f"({truncate_text(command)}) "
+                                f"of pipeline caused error: {error}"
+                            )
+                            result.args = (msg,) + result.args[1:]
+                            raise result
+
+                default_cluster_node = client.get_default_node()
+
+                # Check whether the default node was used. In some cases,
+                # 'client.get_default_node()' may return None. The check below
+                # prevents a potential AttributeError.
+                if default_cluster_node is not None:
+                    default_node = nodes.get(default_cluster_node.name)
+                    if default_node is not None:
+                        # This pipeline execution used the default node, check if we need
+                        # to replace it.
+                        # Note: when the error is raised we'll reset the default node in the
+                        # caller function.
+                        for cmd in default_node[1]:
+                            # Check if it has a command that failed with a relevant
+                            # exception
+                            if type(cmd.result) in RedisCluster.ERRORS_ALLOW_RETRY:
+                                client.replace_default_node()
+                                break
+            elif follow_scope is not None:
+                self._follow_finalize_writes(follow_scope, follow_prior, follow_spec)
+                follow_finalized = True
+
+            return [cmd.result for cmd in stack]
+        finally:
+            if follow_scope is not None and not follow_finalized:
+                # Planning or sending aborted before reconciliation: undo the
+                # speculative pins this batch previewed.
+                follow_scope.restore_slots(dict(follow_prior))
+
+    async def _follow_preview_write(
+        self,
+        scope: FollowScope,
+        prior_binds: dict,
+        speculative: list,
+        cmd: "PipelineCommand",
+        command_policies,
+    ) -> None:
+        """Speculatively pin a queued write's slots before later reads route."""
+        if command_policies.request_policy != RequestPolicy.DEFAULT_KEYED:
+            return
+        command = normalize_command(cmd.args)
+        if is_follow_ignored(command):
+            return
+        if await self._pipe.cluster_client._is_replica_safe(command):
+            return
+
+        if command in WRITE_SCRIPT_COMMANDS:
+            slots = [
+                self._pipe.cluster_client.keyslot(key)
+                for key in cmd.args[3 : 3 + int(cmd.args[2])]
+            ]
+        else:
+            slot = await self._pipe.cluster_client._determine_slot(*cmd.args)
+            slots = [slot] if slot is not None else []
+        if not slots:
+            return
+        slots = tuple(dict.fromkeys(slots))
+        for slot in slots:
+            if slot not in prior_binds:
+                prior_binds.update(scope.snapshot_slots([slot]))
+            primary = self._pipe.cluster_client.nodes_manager.get_node_from_slot(
+                slot, False
+            )
+            scope.bind(slot, primary.name)
+        speculative.append((cmd, slots))
+
+    @staticmethod
+    def _follow_finalize_writes(
+        scope: FollowScope, prior_binds: dict, speculative: list
+    ) -> None:
+        """Keep a pin only when at least one of its queued writes landed."""
+        commands_by_slot: dict[int, list["PipelineCommand"]] = {}
+        for cmd, slots in speculative:
+            for slot in slots:
+                commands_by_slot.setdefault(slot, []).append(cmd)
+        failed_slots = {
+            slot
+            for slot, commands in commands_by_slot.items()
+            if all(isinstance(cmd.result, Exception) for cmd in commands)
+        }
+        if failed_slots:
+            scope.restore_slots({slot: prior_binds[slot] for slot in failed_slots})
 
     async def reset(self):
         """
@@ -3491,6 +3664,16 @@ class TransactionStrategy(AbstractStrategy):
                 server_port=connection.port,
                 db_namespace=str(connection.db),
             )
+
+            follow_scope = FollowScope.current()
+            if follow_scope is not None:
+                # A watched/immediate write landed on the transaction primary.
+                await self._pipe.cluster_client._follow_bind_write(
+                    follow_scope,
+                    normalize_command(args),
+                    args,
+                    RequestPolicy.DEFAULT_KEYED,
+                )
 
             return response
         except Exception as e:
@@ -3731,6 +3914,20 @@ class TransactionStrategy(AbstractStrategy):
                 self._command_queue,
                 start_time,
             )
+
+        follow_scope = FollowScope.current()
+        if follow_scope is not None:
+            # EXEC succeeded: bind the slots of the writes actually applied.
+            client = self._pipe.cluster_client
+            for result, cmd in zip(response, self._command_queue):
+                if isinstance(result, Exception):
+                    continue
+                await client._follow_bind_write(
+                    follow_scope,
+                    normalize_command(cmd.args),
+                    cmd.args,
+                    RequestPolicy.DEFAULT_KEYED,
+                )
 
         # We have to run response callbacks manually
         data = []

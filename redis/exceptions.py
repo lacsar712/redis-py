@@ -334,3 +334,14 @@ class IncorrectPolicyType(Exception):
     """
 
     pass
+
+
+class FollowScopeError(RedisError):
+    """
+    Raised for invalid uses of a :class:`~redis.follow_scope.FollowScope`,
+    such as re-entering a scope that was already exited, entering one scope
+    object concurrently from two asyncio tasks, or attempting to serve a
+    pinned read through a replica connection while a scope is active.
+    """
+
+    pass

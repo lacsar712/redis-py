@@ -89,6 +89,13 @@ from redis.exceptions import (
     TryAgainError,
     WatchError,
 )
+from redis.follow_scope import (
+    FollowScope,
+    is_follow_ignored,
+    normalize_command,
+    select_cluster_node,
+    write_command_slots,
+)
 from redis.himport import HImportRegistry, parse_himport_set_args
 from redis.lock import Lock
 from redis.maint_notifications import (
@@ -1027,14 +1034,16 @@ class RedisCluster(
             RequestPolicy.DEFAULT_KEYLESS: lambda command_name: [
                 self.get_keyless_target_node(command_name)
             ],
-            RequestPolicy.DEFAULT_KEYED: lambda command,
-            *args: self.get_nodes_from_slot(command, *args),
+            RequestPolicy.DEFAULT_KEYED: lambda command, *args: (
+                self.get_nodes_from_slot(command, *args)
+            ),
             RequestPolicy.DEFAULT_NODE: lambda: [self.get_default_node()],
             RequestPolicy.ALL_SHARDS: self.get_primaries,
             RequestPolicy.ALL_NODES: self.get_nodes,
             RequestPolicy.ALL_REPLICAS: self.get_replicas,
-            RequestPolicy.MULTI_SHARD: lambda *args,
-            **kwargs: self._split_multi_shard_command(*args, **kwargs),
+            RequestPolicy.MULTI_SHARD: lambda *args, **kwargs: (
+                self._split_multi_shard_command(*args, **kwargs)
+            ),
             RequestPolicy.SPECIAL: self.get_special_nodes,
             ResponsePolicy.DEFAULT_KEYLESS: lambda res: res,
             ResponsePolicy.DEFAULT_KEYED: lambda res: res,
@@ -1220,12 +1229,68 @@ class RedisCluster(
         replica_safe = (
             self.read_from_replicas or self.load_balancing_strategy is not None
         ) and self._is_replica_safe(command)
-        node = self.nodes_manager.get_node_from_slot(
+        node = self._select_slot_node(command, slot, replica_safe)
+        return [node]
+
+    def _select_slot_node(self, command: str, slot: int, replica_safe: bool):
+        """
+        Pick the node for a keyed command.
+
+        Inside an active follow scope, a slot the scope has already bound stays
+        on its primary for both reads and writes - the binding wins over the
+        replica policy. Commands the scope ignores (blocking pops, pub/sub)
+        and unbound slots keep their current node selection exactly.
+        """
+        if not is_follow_ignored(command):
+            scope = FollowScope.current()
+            if scope is not None:
+                node = select_cluster_node(scope, slot, self.nodes_manager)
+                if node is not None:
+                    return node
+        return self.nodes_manager.get_node_from_slot(
             slot,
             replica_safe,
             self.load_balancing_strategy if replica_safe else None,
         )
-        return [node]
+
+    def follow_scope(self) -> FollowScope:
+        """
+        Open a follow scope in which reads follow the primary that accepted a
+        write done earlier in the same scope.
+
+        Use as a context manager::
+
+            with client.follow_scope():
+                client.set("key", "value")
+                client.get("key")  # served by the primary above, never a replica
+
+        Only slots written inside the scope are pinned; every other slot keeps
+        the client's current replica policy. Bindings live on the returned
+        scope and scopes may nest. Outside an active scope nothing changes.
+        """
+        return FollowScope()
+
+    def _follow_bind_write(
+        self, scope: FollowScope, command: str, args: tuple, request_policy
+    ) -> None:
+        """
+        Bind the slots of a successful keyed write to the primary that served
+        it. Read-only scripts and commands the scope ignores never bind.
+        """
+        if request_policy != RequestPolicy.DEFAULT_KEYED:
+            return
+        if is_follow_ignored(command):
+            return
+        if self._is_replica_safe(command):
+            return
+        slots = write_command_slots(command, args, self.keyslot, self.determine_slot)
+        if not slots:
+            return
+        for slot in set(slots):
+            # The slots cache was just used to serve the write (and repaired
+            # on a MOVED), so its primary is the node that accepted it.
+            primary = self.nodes_manager.get_node_from_slot(slot, False)
+            scope.bind(slot, primary.name)
 
     def _split_multi_shard_command(self, *args, **kwargs) -> list[dict]:
         """
@@ -1826,8 +1891,18 @@ class RedisCluster(
                         and target_nodes[0] == self.get_default_node()
                     ):
                         is_default_node = True
+                follow_scope = FollowScope.current()
                 for node in target_nodes:
                     res[node.name] = self._execute_command(node, *args, **kwargs)
+                    if follow_scope is not None:
+                        # Bind only once the write has actually succeeded on a
+                        # primary; a raised command never reaches this point.
+                        self._follow_bind_write(
+                            follow_scope,
+                            command,
+                            args,
+                            command_policies.request_policy,
+                        )
 
                     if command_policies.response_policy == ResponsePolicy.ONE_SUCCEEDED:
                         break
@@ -1945,17 +2020,15 @@ class RedisCluster(
                     target_node = self.get_node(node_name=redirect_addr)
                 elif moved:
                     # MOVED occurred and the slots cache was updated,
-                    # refresh the target node
+                    # refresh the target node. This goes through the same
+                    # follow-scope selection so a pinned read stays on the
+                    # (new) primary and is never retried against a replica.
                     slot = self.determine_slot(*args)
                     replica_safe = (
                         self.read_from_replicas
                         or self.load_balancing_strategy is not None
                     ) and self._is_replica_safe(command)
-                    target_node = self.nodes_manager.get_node_from_slot(
-                        slot,
-                        replica_safe,
-                        self.load_balancing_strategy if replica_safe else None,
-                    )
+                    target_node = self._select_slot_node(command, slot, replica_safe)
                     moved = False
 
                 redis_node = self.get_redis_connection(target_node)
@@ -4556,14 +4629,16 @@ class ClusterPipeline(RedisCluster):
             RequestPolicy.DEFAULT_KEYLESS: lambda command_name: [
                 self.get_keyless_target_node(command_name)
             ],
-            RequestPolicy.DEFAULT_KEYED: lambda command,
-            *args: self.get_nodes_from_slot(command, *args),
+            RequestPolicy.DEFAULT_KEYED: lambda command, *args: (
+                self.get_nodes_from_slot(command, *args)
+            ),
             RequestPolicy.DEFAULT_NODE: lambda: [self.get_default_node()],
             RequestPolicy.ALL_SHARDS: self.get_primaries,
             RequestPolicy.ALL_NODES: self.get_nodes,
             RequestPolicy.ALL_REPLICAS: self.get_replicas,
-            RequestPolicy.MULTI_SHARD: lambda *args,
-            **kwargs: self._split_multi_shard_command(*args, **kwargs),
+            RequestPolicy.MULTI_SHARD: lambda *args, **kwargs: (
+                self._split_multi_shard_command(*args, **kwargs)
+            ),
             RequestPolicy.SPECIAL: self.get_special_nodes,
             ResponsePolicy.DEFAULT_KEYLESS: lambda res: res,
             ResponsePolicy.DEFAULT_KEYED: lambda res: res,
@@ -5198,6 +5273,41 @@ class PipelineStrategy(AbstractStrategy):
         # the commands that were queued up.
         # if we have to run through it again, we only retry
         # the commands that failed.
+        # Follow-scope bookkeeping for this batch. A write earlier in the SAME
+        # pipeline must pin its slot before a read queued later picks a node,
+        # without splitting the pipeline or reordering commands. Pins are
+        # speculative until the responses prove the writes succeeded.
+        follow_scope = FollowScope.current()
+        follow_prior: dict[int, Any] = {}
+        follow_spec: list[tuple[PipelineCommand, tuple]] = []
+        follow_finalized = [False]
+        try:
+            return self._send_cluster_commands_follow(
+                stack,
+                raise_on_error,
+                allow_redirections,
+                follow_scope,
+                follow_prior,
+                follow_spec,
+                follow_finalized,
+            )
+        finally:
+            # Covers every abort before normal finalization (planning errors,
+            # broken sockets): speculative pins cannot be trusted to have
+            # landed, so undo everything this batch previewed.
+            if follow_scope is not None and not follow_finalized[0]:
+                follow_scope.restore_slots(dict(follow_prior))
+
+    def _send_cluster_commands_follow(
+        self,
+        stack,
+        raise_on_error,
+        allow_redirections,
+        follow_scope,
+        follow_prior,
+        follow_spec,
+        follow_finalized,
+    ):
         attempt = sorted(stack, key=lambda x: x.position)
         is_default_node = False
         # build a list of node objects based on node names we need to
@@ -5263,6 +5373,18 @@ class PipelineStrategy(AbstractStrategy):
                             else:
                                 command_policies = _DEFAULT_KEYLESS_METADATA
 
+                    # Pin the slots of an earlier queued write before a read
+                    # queued later resolves its node. Commands are still
+                    # grouped into the single packed write per node below -
+                    # nothing is reordered or split into single executions.
+                    if follow_scope is not None:
+                        self._follow_preview_write(
+                            follow_scope,
+                            follow_prior,
+                            follow_spec,
+                            c,
+                            command_policies,
+                        )
                     target_nodes = self._determine_nodes(
                         *c.args,
                         request_policy=command_policies.request_policy,
@@ -5419,6 +5541,14 @@ class PipelineStrategy(AbstractStrategy):
                 except RedisError as e:
                     c.result = e
 
+        if follow_scope is not None:
+            # Keep only the speculative pins whose writes actually landed;
+            # MOVED-repaired writes already rebound themselves to the new
+            # primary through the single-command path, so a pin kept here
+            # always names a primary, never a replica.
+            self._follow_finalize_writes(follow_scope, follow_prior, follow_spec)
+            follow_finalized[0] = True
+
         # turn the response back into a simple flat array that corresponds
         # to the sequence of commands issued in the stack in pipeline.execute()
         response = []
@@ -5439,6 +5569,57 @@ class PipelineStrategy(AbstractStrategy):
             self._raise_first_error(stack, start_time)
 
         return response
+
+    def _follow_preview_write(
+        self, scope, prior_binds, speculative, c: "PipelineCommand", command_policies
+    ) -> None:
+        """
+        Bind the slots a queued write is about to hit before later queued
+        reads pick their nodes.
+
+        The write itself always routes to a primary already, so its own node
+        does not change; the preview only affects reads positioned later in
+        the same pipeline. ``prior_binds`` remembers what the scope held
+        before this batch so a write that does not land can be rolled back.
+        """
+        if command_policies.request_policy != RequestPolicy.DEFAULT_KEYED:
+            return
+        command = normalize_command(c.args)
+        if is_follow_ignored(command):
+            return
+        if self._pipe._is_replica_safe(command):
+            return
+        slots = write_command_slots(
+            command, c.args, self._pipe.keyslot, self._pipe.determine_slot
+        )
+        if not slots:
+            return
+        slots = tuple(dict.fromkeys(slots))
+        for slot in slots:
+            if slot not in prior_binds:
+                prior_binds.update(scope.snapshot_slots([slot]))
+            primary = self._pipe.nodes_manager.get_node_from_slot(slot, False)
+            scope.bind(slot, primary.name)
+        speculative.append((c, slots))
+
+    @staticmethod
+    def _follow_finalize_writes(scope, prior_binds, speculative) -> None:
+        """
+        Keep a speculative pin only when at least one queued write of that
+        slot landed (its result is not an exception). Every other pin goes
+        back to its pre-pipeline state, so a failed write never pins a read.
+        """
+        commands_by_slot: dict[int, list["PipelineCommand"]] = {}
+        for c, slots in speculative:
+            for slot in slots:
+                commands_by_slot.setdefault(slot, []).append(c)
+        failed_slots = {
+            slot
+            for slot, commands in commands_by_slot.items()
+            if all(isinstance(c.result, Exception) for c in commands)
+        }
+        if failed_slots:
+            scope.restore_slots({slot: prior_binds[slot] for slot in failed_slots})
 
     def _is_nodes_flag(self, target_nodes):
         return isinstance(target_nodes, str) and target_nodes in self._pipe.node_flags
@@ -5693,6 +5874,17 @@ class TransactionStrategy(AbstractStrategy):
                 db_namespace=str(connection.db),
             )
 
+            follow_scope = FollowScope.current()
+            if follow_scope is not None:
+                # A watched/immediate write landed on the transaction's
+                # primary; pin it like any other successful scope write.
+                self._pipe._follow_bind_write(
+                    follow_scope,
+                    normalize_command(args),
+                    args,
+                    RequestPolicy.DEFAULT_KEYED,
+                )
+
             return response
         except Exception as e:
             if connection:
@@ -5929,6 +6121,22 @@ class TransactionStrategy(AbstractStrategy):
                 self._command_queue,
                 start_time,
             )
+
+        follow_scope = FollowScope.current()
+        if follow_scope is not None:
+            # EXEC succeeded: bind the slots of the writes the transaction
+            # actually applied (failed replies never bind). The transaction is
+            # single-slot and was served on the primary, so the slot cache's
+            # primary is the node that accepted it.
+            for result, cmd in zip(response, self._command_queue):
+                if isinstance(result, Exception):
+                    continue
+                self._pipe._follow_bind_write(
+                    follow_scope,
+                    normalize_command(cmd.args),
+                    cmd.args,
+                    RequestPolicy.DEFAULT_KEYED,
+                )
 
         # We have to run response callbacks manually
         data = []

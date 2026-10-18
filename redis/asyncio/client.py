@@ -80,10 +80,16 @@ from redis.event import (
 from redis.exceptions import (
     ConnectionError,
     ExecAbortError,
+    FollowScopeError,
     PubSubError,
     RedisError,
     ResponseError,
     WatchError,
+)
+from redis.follow_scope import (
+    FollowScope,
+    is_follow_ignored,
+    normalize_command,
 )
 from redis.himport import HImportRegistry, parse_himport_set_args
 from redis.maint_notifications import MaintNotificationsConfig
@@ -126,6 +132,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Lazily built static metadata resolver used to classify writes for sentinel
+# follow scopes when the pool carries no custom resolver.
+_ASYNC_FOLLOW_METADATA_RESOLVER = None
 
 
 def is_debug_log_enabled():
@@ -958,6 +968,17 @@ class Redis(
         command_name = args[0]
         conn = self.connection or await pool.get_connection()
 
+        follow_scope = FollowScope.current()
+        if follow_scope is not None:
+            # Sentinel follow-scope gate: pinned reads must be served by the
+            # confirmed master, never by a replica. No-op for plain pools.
+            try:
+                await self._follow_sentinel_gate(follow_scope, pool, conn, command_name)
+            except Exception:
+                if not self.connection:
+                    await pool.release(conn)
+                raise
+
         # Start timing for observability
         start_time = time.monotonic()
         # Track actual retry attempts for error reporting
@@ -982,6 +1003,12 @@ class Redis(
                 failure_callback,
                 with_failure_count=True,
             )
+
+            if follow_scope is not None:
+                # A successful write notes the master that served it.
+                await self._follow_sentinel_note_write(
+                    follow_scope, pool, conn, command_name, args
+                )
 
             await record_operation_duration(
                 command_name=command_name,
@@ -1012,6 +1039,80 @@ class Redis(
                     self._single_conn_lock.release()
                 if not self.connection:
                     await pool.release(conn)
+
+    def follow_scope(self) -> FollowScope:
+        """
+        Open a follow scope as an async context manager.
+
+        With a regular (single endpoint) client nothing is routed differently.
+        With a Sentinel-managed master client, writes inside the scope note the
+        current master and subsequent reads stay on a confirmed master; if a
+        failover happens before Sentinel confirms the new master, the read
+        fails instead of being served by a replica.
+        """
+        return FollowScope()
+
+    @staticmethod
+    async def _follow_command_is_write(pool, args) -> bool:
+        command = normalize_command(args)
+        if is_follow_ignored(command):
+            return False
+        resolver = getattr(pool, "metadata_resolver", None)
+        if resolver is None:
+            global _ASYNC_FOLLOW_METADATA_RESOLVER
+            if _ASYNC_FOLLOW_METADATA_RESOLVER is None:
+                from redis.commands.metadata import AsyncStaticMetadataResolver
+
+                _ASYNC_FOLLOW_METADATA_RESOLVER = AsyncStaticMetadataResolver()
+            resolver = _ASYNC_FOLLOW_METADATA_RESOLVER
+        return not await resolver.is_replica_safe(command)
+
+    async def _follow_sentinel_gate(self, scope, pool, conn, command_name) -> None:
+        """
+        Enforce master-pinned reads for a Sentinel pool inside a follow scope.
+        """
+        from redis.asyncio.sentinel import SentinelConnectionPool
+
+        if not isinstance(pool, SentinelConnectionPool):
+            return
+        service = pool.service_name
+        if not pool.is_master:
+            if scope.sentinel_pinned(service) is not None:
+                raise FollowScopeError(
+                    "Follow scope: reads of a pinned service cannot be served "
+                    "by a replica connection"
+                )
+            return
+
+        pinned = scope.sentinel_pinned(service)
+        if pinned is None:
+            return
+        # Existing Sentinel discovery/refresh: asks Sentinel for the current
+        # master and disconnects idle connections to a demoted one.
+        address = await pool.get_master_address()
+        if address != pinned:
+            scope.rebase_sentinel_master(service, address)
+        if (conn.host, conn.port) != address:
+            # Stale connection targeting the previous master: fail instead of
+            # reading from the node that is now a replica. The next attempt
+            # reconnects through the pool to the confirmed master.
+            await conn.disconnect()
+            raise ConnectionError(
+                "Follow scope: the connection still targets the previous "
+                "master; reconnecting through Sentinel before the read"
+            )
+
+    async def _follow_sentinel_note_write(
+        self, scope, pool, conn, command_name, args
+    ) -> None:
+        """Record the master that accepted a successful scope write."""
+        from redis.asyncio.sentinel import SentinelConnectionPool
+
+        if not isinstance(pool, SentinelConnectionPool) or not pool.is_master:
+            return
+        if not await self._follow_command_is_write(pool, args):
+            return
+        scope.pin_sentinel_master(pool.service_name, (conn.host, conn.port))
 
     async def parse_response(
         self, connection: Connection, command_name: Union[str, bytes], **options

@@ -27,6 +27,7 @@ from redis.exceptions import (
     ChildDeadlockedError,
     ConnectionError,
     DataError,
+    FollowScopeError,
     InvalidResponse,
     OutOfMemoryError,
     PubSubError,
@@ -36,6 +37,7 @@ from redis.exceptions import (
     TimeoutError,
     WatchError,
 )
+from redis.follow_scope import FollowScope
 from redis.typing import Subscription
 
 __all__ = [
@@ -51,6 +53,8 @@ __all__ = [
     "ConnectionError",
     "ConnectionPool",
     "DataError",
+    "FollowScope",
+    "FollowScopeError",
     "from_url",
     "default_backoff",
     "InvalidResponse",

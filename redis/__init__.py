@@ -35,6 +35,7 @@ from redis.exceptions import (
     ConnectionError,
     CrossSlotTransactionError,
     DataError,
+    FollowScopeError,
     InvalidPipelineStack,
     InvalidResponse,
     MaxConnectionsError,
@@ -47,6 +48,7 @@ from redis.exceptions import (
     TimeoutError,
     WatchError,
 )
+from redis.follow_scope import FollowScope
 from redis.sentinel import (
     Sentinel,
     SentinelConnectionPool,
@@ -85,6 +87,8 @@ __all__ = [
     "DataError",
     "DriverInfo",
     "EventType",
+    "FollowScope",
+    "FollowScopeError",
     "from_url",
     "default_backoff",
     "InvalidPipelineStack",
